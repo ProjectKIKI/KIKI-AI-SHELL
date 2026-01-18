@@ -37,7 +37,7 @@ func Main() {
 	flag.Parse()
 
 	if *fHelp {
-		shell.PrintHelp()
+		shell.PrintHelp("")
 		return
 	}
 	if strings.TrimSpace(*fProfile) != "" {
@@ -56,6 +56,23 @@ func Main() {
 	if len(args) > 0 {
 		st := shell.NewState(cfg, uicfg)
 		st.Files = append(st.Files, []string(files)...)
+		if args[0] == "gen" {
+			if len(args) < 3 {
+				fmt.Fprintln(os.Stderr, "usage: kiki-ai-shell gen <path> <prompt...>")
+				os.Exit(1)
+			}
+			out := args[1]
+			p := strings.TrimSpace(strings.Join(args[2:], " "))
+			if p == "" {
+				fmt.Fprintln(os.Stderr, "gen: prompt is empty")
+				os.Exit(1)
+			}
+			if err := shell.RunGen(cfg, st, out, p); err != nil {
+				fmt.Fprintln(os.Stderr, "gen error:", err)
+				os.Exit(1)
+			}
+			return
+		}
 		if args[0] == "ask" {
 			p := strings.TrimSpace(strings.Join(args[1:], " "))
 			if p == "" {

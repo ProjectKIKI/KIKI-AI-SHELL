@@ -15,5 +15,5 @@ func promptLine(st *State) string {
 	if st.RAG != nil && st.RAG.Enabled {
 		rag = "on"
 	}
-	return fmt.Sprintf("kiki[%s|stream:%s|files:%d|rag:%s] %s> ", st.Profile, stream, len(st.Files), rag, cwd)
+	return fmt.Sprintf("kiki[%s|user:%s|stream:%s|files:%d|rag:%s] %s> ", st.Profile, st.User, stream, len(st.Files), rag, cwd)
 }

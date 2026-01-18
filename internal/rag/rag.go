@@ -9,13 +9,16 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 	"unicode/utf8"
 )
 
 type Doc struct {
-	ID   string
-	Path string
-	Text string
+	ID      string    `json:"id"`
+	Path    string    `json:"path,omitempty"`
+	Hash    string    `json:"hash"`
+	Text    string    `json:"text"`
+	Created time.Time `json:"created"`
 }
 
 type Store struct {
@@ -36,6 +39,40 @@ func trimRunes(s string, n int) string {
 	}
 	r := []rune(s)
 	return string(r[:n])
+}
+
+// AddText adds an in-memory text blob to the store (useful for command history, notes, etc.).
+func (s *Store) AddText(path string, text string, maxChars int) error {
+	if s == nil {
+		return nil
+	}
+	p := strings.TrimSpace(path)
+	if p == "" {
+		p = "(text)"
+	}
+	t := strings.TrimSpace(text)
+	if t == "" {
+		return nil
+	}
+	if maxChars > 0 && len([]rune(t)) > maxChars {
+		r := []rune(t)
+		t = string(r[:maxChars])
+	}
+	sum := sha256.Sum256([]byte(t))
+	h := hex.EncodeToString(sum[:])
+
+	// overwrite if same path exists
+	for i := range s.Docs {
+		if s.Docs[i].Path == p {
+			s.Docs[i].ID = h
+			s.Docs[i].Hash = h
+			s.Docs[i].Text = t
+			s.Docs[i].Created = time.Now()
+			return nil
+		}
+	}
+	s.Docs = append(s.Docs, Doc{ID: h, Path: p, Hash: h, Text: t, Created: time.Now()})
+	return nil
 }
 
 func (s *Store) AddFile(path string, maxBytes, maxChars int) (Doc, error) {
@@ -59,7 +96,10 @@ func (s *Store) AddFile(path string, maxBytes, maxChars int) (Doc, error) {
 		txt = trimRunes(txt, maxChars)
 	}
 	sum := sha256.Sum256([]byte(p + ":" + txt))
-	d := Doc{ID: hex.EncodeToString(sum[:]), Path: p, Text: txt}
+	id := hex.EncodeToString(sum[:])
+	sumTxt := sha256.Sum256([]byte(txt))
+	h := hex.EncodeToString(sumTxt[:])
+	d := Doc{ID: id, Path: p, Hash: h, Text: txt, Created: time.Now()}
 	for i := range s.Docs {
 		if s.Docs[i].Path == p {
 			s.Docs[i] = d

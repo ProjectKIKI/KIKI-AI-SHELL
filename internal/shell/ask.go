@@ -9,9 +9,11 @@ import (
 	"syscall"
 	"time"
 
+	"kiki-ai-shell/internal/agent"
 	"kiki-ai-shell/internal/config"
 	"kiki-ai-shell/internal/history"
 	"kiki-ai-shell/internal/llm"
+	"kiki-ai-shell/internal/usage"
 )
 
 func buildEndpoint(cfg *config.Config) string {
@@ -26,6 +28,10 @@ func systemPromptWithCtx(cfg *config.Config, st *State, overrideSystem string) s
 	if sys == "" {
 		sys = cfg.SystemPrompt
 	}
+	if st != nil && st.NoFence {
+		sys = strings.TrimSpace(sys) + "\n\n[Output Rules]\n- \uc808\ub300 ``` ... ``` \ud615\ud0dc\uc758 \ub9c8\ud06c\ub2e4\uc6b4 \ucf54\ub4dc\ud39c\uc2a4\ub97c \ucd9c\ub825\ud558\uc9c0 \ub9c8\uc138\uc694 (```yaml \uad6c\ubb38\ub3c4 \uae08\uc9c0).\n- \ud544\uc694\ud558\uba74 \uc21c\uc218 \ud14d\uc2a4\ud2b8\ub85c\ub9cc \ucd9c\ub825\ud558\uc138\uc694.\n"
+	}
+
 	if st != nil && len(st.Ctx) > 0 {
 		var b strings.Builder
 		b.WriteString(sys)
@@ -86,12 +92,64 @@ func Ask(cfg *config.Config, st *State, prompt string, overrideSystem string) {
 	now := time.Now().Format(time.RFC3339)
 	cwd, _ := os.Getwd()
 
+	// Local agent: if the request is likely bigger than ctx-size, chunk it automatically.
+	maxCtx := st.CtxSizeObserved
+	if maxCtx <= 0 {
+		maxCtx = st.CtxSizeTarget
+	}
+	if maxCtx > 0 {
+		reserve := 768
+		// Be a bit conservative for system+overhead.
+		if agent.EstimateTokens(userContent) > (maxCtx - reserve) {
+			out, err := agent.AskWithAutoChunk(ctx, endpoint, sys, prompt, userContent, agent.AskOpts{
+				MaxCtx:    maxCtx,
+				Reserve:   reserve,
+				Timeout:   timeout,
+				Stream:    false, // chunk mode prints as one final answer
+				Model:     cfg.Model,
+				Temp:      cfg.Temp,
+				MaxTokens: cfg.MaxTokens,
+			})
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "LLM error:", err)
+				if obs := parseCtxSizeFromError(err); obs > 0 {
+					st.CtxSizeObserved = obs
+				}
+				return
+			}
+			if st.NoFence {
+				out = StripMarkdownFences(out)
+			}
+			fmt.Println(out)
+			st.LastAnswer = out
+			if st.Usage != nil {
+				cwd, _ := os.Getwd()
+				st.Usage.Append(usage.Record{Time: now, User: st.User, Type: "ask", Cwd: cwd, Prompt: prompt, RespPrev: truncateRunes(out, cfg.HistoryPreview)})
+				_ = st.RAG.AddText("usage:"+now+":ask", "[ask] "+prompt, 8000)
+			}
+			if cfg.HistoryEnabled {
+				history.Append(cfg.HistoryPath, history.Record{
+					Time: now, Endpoint: endpoint, Profile: st.Profile, Model: cfg.Model,
+					Temperature: cfg.Temp, MaxTokens: cfg.MaxTokens, Stream: false,
+					SystemPrompt: sys, Ctx: st.Ctx, Prompt: prompt, Files: usedFiles,
+					FileHashes: hashes, Cwd: cwd, ResponsePrev: truncateRunes(out, cfg.HistoryPreview),
+				})
+			}
+			return
+		}
+	}
+
 	if st.Stream {
 		capLimit := cfg.HistoryPreview
 		if cfg.CaptureFull {
 			capLimit = cfg.CaptureMax
 		}
-		captured, err := llm.DoStream(ctx, endpoint, req, capLimit, func(s string) { fmt.Print(s) })
+		captured, err := llm.DoStream(ctx, endpoint, req, capLimit, func(s string) {
+			if st.NoFence {
+				s = StripFencesFromChunk(s)
+			}
+			fmt.Print(s)
+		})
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "LLM stream error:", err)
 			if obs := parseCtxSizeFromError(err); obs > 0 {
@@ -102,7 +160,15 @@ func Ask(cfg *config.Config, st *State, prompt string, overrideSystem string) {
 			}
 			return
 		}
+		if st.NoFence {
+			captured = StripMarkdownFences(captured)
+		}
 		st.LastAnswer = captured
+		if st.Usage != nil {
+			cwd, _ := os.Getwd()
+			st.Usage.Append(usage.Record{Time: now, User: st.User, Type: "ask", Cwd: cwd, Prompt: prompt, RespPrev: truncateRunes(captured, cfg.HistoryPreview)})
+			_ = st.RAG.AddText("usage:"+now+":ask", "[ask] "+prompt, 8000)
+		}
 		if cfg.HistoryEnabled {
 			history.Append(cfg.HistoryPath, history.Record{
 				Time: now, Endpoint: endpoint, Profile: st.Profile, Model: cfg.Model,
@@ -125,8 +191,16 @@ func Ask(cfg *config.Config, st *State, prompt string, overrideSystem string) {
 		}
 		return
 	}
+	if st.NoFence {
+		out = StripMarkdownFences(out)
+	}
 	fmt.Println(out)
 	st.LastAnswer = out
+	if st.Usage != nil {
+		cwd, _ := os.Getwd()
+		st.Usage.Append(usage.Record{Time: now, User: st.User, Type: "ask", Cwd: cwd, Prompt: prompt, RespPrev: truncateRunes(out, cfg.HistoryPreview)})
+		_ = st.RAG.AddText("usage:"+now+":ask", "[ask] "+prompt, 8000)
+	}
 	if cfg.HistoryEnabled {
 		history.Append(cfg.HistoryPath, history.Record{
 			Time: now, Endpoint: endpoint, Profile: st.Profile, Model: cfg.Model,

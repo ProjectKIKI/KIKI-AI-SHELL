@@ -49,6 +49,7 @@ func DefaultConfig() Config {
 func ResetScroll() { fmt.Print("\033[r") }
 
 type HeaderData struct {
+	User        string
 	Title       string
 	LLM         string
 	Profile     string
@@ -58,6 +59,8 @@ type HeaderData struct {
 	Cluster     string
 	Namespace   string
 	Files       []string
+	NoFence     bool
+	PCP         string
 }
 
 func elideMiddle(s string, max int) string {
@@ -72,6 +75,9 @@ func elideMiddle(s string, max int) string {
 	tail := max - head - 1
 	return string(r[:head]) + "…" + string(r[len(r)-tail:])
 }
+
+// ElideMiddle is an exported wrapper for elideMiddle.
+
 func padRight(s string, width int) string {
 	r := []rune(s)
 	if len(r) >= width {
@@ -84,11 +90,37 @@ func RenderHeader(cfg Config, hd HeaderData) {
 	if !cfg.ShowHeader {
 		return
 	}
-	if cfg.ClearOnDraw {
+
+	// When fixed header is enabled, we reserve a fixed number of lines at the top
+	// and set the terminal scroll region to everything below the header.
+	fixedLines := 0
+
+	// Fixed header mode: pin the header to the top using a scroll region.
+	// This keeps the header visible while command output scrolls below it.
+	if cfg.FixedHeader {
+		lines := cfg.HeaderLines
+		if lines <= 0 {
+			lines = 5
+		}
+		fixedLines = lines
+		// Draw header in-place without resetting the scroll region.
+		// Frequent scroll-region resets can prevent normal scrolling in some terminals.
+			CursorHome() // move to 1,1
+		for i := 0; i < lines; i++ {
+			fmt.Print("\033[2K") // clear line
+			if i < lines-1 {
+				fmt.Print("\n")
+			}
+		}
+			CursorHome()
+	} else if cfg.ClearOnDraw {
 		fmt.Print("\033[H\033[2J")
 	}
 
-	cols := 100
+	cols := TermCols()
+	if cols < 50 {
+		cols = 50
+	}
 	inner := cols - 2
 
 	title := hd.Title
@@ -107,7 +139,19 @@ func RenderHeader(cfg Config, hd HeaderData) {
 	if hd.Stream {
 		stream = "on"
 	}
-	line1 := fmt.Sprintf(" LLM: %s | profile: %s | stream: %s ", hd.LLM, hd.Profile, stream)
+	fence := "on"
+	if hd.NoFence {
+		fence = "off"
+	}
+	userPart := ""
+	if strings.TrimSpace(hd.User) != "" {
+		userPart = fmt.Sprintf("user:%s | ", hd.User)
+	}
+	pcpPart := ""
+	if strings.TrimSpace(hd.PCP) != "" {
+		pcpPart = fmt.Sprintf(" | pcp: %s", hd.PCP)
+	}
+	line1 := fmt.Sprintf(" %sLLM: %s | profile: %s | stream: %s | fence: %s%s ", userPart, hd.LLM, hd.Profile, stream, fence, pcpPart)
 	if hd.CtxObserved > 0 || hd.CtxTarget > 0 {
 		if hd.CtxObserved > 0 && hd.CtxTarget > 0 {
 			line1 += fmt.Sprintf("| ctx: %d/%d ", hd.CtxObserved, hd.CtxTarget)
@@ -141,16 +185,25 @@ func RenderHeader(cfg Config, hd HeaderData) {
 	if maxFiles <= 0 {
 		maxFiles = 120
 	}
-	files = elideMiddle(files, maxFiles)
+	files = ElideMiddle(files, maxFiles)
 	line3 := fmt.Sprintf(" Files: %s ", files)
 
-	line1 = padRight(elideMiddle(line1, inner), inner)
-	line2 := padRight(elideMiddle(k8s, inner), inner)
-	line3 = padRight(elideMiddle(line3, inner), inner)
+	line1 = padRight(ElideMiddle(line1, inner), inner)
+	line2 := padRight(ElideMiddle(k8s, inner), inner)
+	line3 = padRight(ElideMiddle(line3, inner), inner)
 
 	fmt.Println(top)
 	fmt.Println("│" + line1 + "│")
 	fmt.Println("│" + line2 + "│")
 	fmt.Println("│" + line3 + "│")
 	fmt.Println("└" + strings.Repeat("─", inner) + "┘")
+
+	if fixedLines > 0 {
+		rows := TermRows()
+		// Scroll region starts *after* the header. Everything below will scroll normally.
+		SetScrollRegion(fixedLines+1, rows)
+		// Put the prompt at the bottom so we don't overwrite previous output.
+		CursorAt(rows, 1)
+		fmt.Print("\033[2K")
+	}
 }

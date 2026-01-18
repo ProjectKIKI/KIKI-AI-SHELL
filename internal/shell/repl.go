@@ -1,58 +1,105 @@
 package shell
 
 import (
-	"bufio"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
+	"kiki-ai-shell/internal/auth"
 	"kiki-ai-shell/internal/config"
 	"kiki-ai-shell/internal/ui"
+	"kiki-ai-shell/internal/usage"
 )
 
-func renderHeader(cfg *config.Config, st *State) {
-	llmAddr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
-	if strings.TrimSpace(cfg.BaseURL) != "" {
-		llmAddr = cfg.BaseURL
+func firstNonEmpty(a, b string) string {
+	a = strings.TrimSpace(a)
+	if a != "" {
+		return a
 	}
-	ui.RenderHeader(st.UI, ui.HeaderData{
-		Title:       " KIKI AI SHELL ",
-		LLM:         llmAddr,
-		Profile:     st.Profile,
-		Stream:      st.Stream,
-		CtxObserved: st.CtxSizeObserved,
-		CtxTarget:   st.CtxSizeTarget,
-		Cluster:     ctxGet(st, "cluster"),
-		Namespace:   ctxGet(st, "ns"),
-		Files:       st.Files,
-	})
+	return strings.TrimSpace(b)
 }
 
+func renderHeader(cfg *config.Config, st *State, uicfg ui.Config) {
+	if !uicfg.ShowHeader {
+		return
+	}
+
+	llm := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
+	if strings.TrimSpace(cfg.BaseURL) != "" {
+		llm = cfg.BaseURL
+	}
+
+	// ui.RenderHeader will format stream/files; we pass raw values.
+
+	cluster := ctxGet(st, "cluster")
+	ns := ctxGet(st, "ns")
+
+	h := ui.HeaderData{
+		Title:       " KIKI AI SHELL ",
+		User:        st.User,
+		LLM:         llm,
+		Profile:     st.Profile,
+		Stream:      st.Stream,
+		Files:       st.Files,
+		NoFence:     st.NoFence,
+		CtxObserved: st.CtxSizeObserved,
+		CtxTarget:   st.CtxSizeTarget,
+		Cluster:     cluster,
+		Namespace:   ns,
+		PCP:         st.PCP.Display(),
+	}
+	ui.RenderHeader(uicfg, h)
+}
+
+// RunREPL starts interactive shell mode.
 func RunREPL(cfg *config.Config, uicfg ui.Config) {
 	st := NewState(cfg, uicfg)
-	sc := bufio.NewScanner(os.Stdin)
-	sc.Buffer(make([]byte, 1024), 1024*1024)
 
-	for {
-		renderHeader(cfg, st)
-		fmt.Print(promptLine(st))
-		if !sc.Scan() {
-			fmt.Println()
-			ui.ResetScroll()
+	// --- auth (PAM) ---
+	if cfg.AuthPAM {
+		user, err := auth.LoginPAM()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "login failed:", err)
 			return
 		}
-		line := strings.TrimSpace(sc.Text())
+		st.User = user
+		st.Usage = usage.New(cfg.UsageBaseDir, user)
+
+		// preload recent usage into RAG
+		recs, _ := usage.LoadRecent(st.Usage.Path, cfg.UsageLoadDays, cfg.UsageLoadMax)
+		for _, r := range recs {
+			text := fmt.Sprintf("[%s] %s | %s", r.Type, r.Cwd, firstNonEmpty(r.Command, r.Prompt))
+			_ = st.RAG.AddText("usage:"+r.Time, text, 4000)
+		}
+	}
+
+	for {
+		renderHeader(cfg, st, uicfg)
+		line, err := ui.ReadLineRaw(promptLine(st), completeLine)
+		if err != nil {
+			if err == io.EOF {
+				return
+			}
+			fmt.Fprintln(os.Stderr, err)
+			continue
+		}
+		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
 		}
 
+		// internal commands
 		if strings.HasPrefix(line, ":") {
-			handleInternalCommand(cfg, st, line)
+			handleInternalCommand(cfg, st, uicfg, line)
 			continue
 		}
+
+		// LLM ask
 		if strings.HasPrefix(line, "?") {
 			q := strings.TrimSpace(strings.TrimPrefix(line, "?"))
 			if q != "" {
@@ -61,6 +108,22 @@ func RunREPL(cfg *config.Config, uicfg ui.Config) {
 			continue
 		}
 
+		// gen <path> <prompt...>  (generate code only and optionally save)
+		if strings.HasPrefix(line, "gen ") {
+			parts := strings.Fields(line)
+			if len(parts) < 3 {
+				fmt.Println("usage: gen <output_path> <prompt...>")
+				continue
+			}
+			outPath := parts[1]
+			prompt := strings.TrimSpace(strings.TrimPrefix(line, "gen "+outPath))
+			if err := Gen(cfg, st, outPath, prompt); err != nil {
+				fmt.Fprintln(os.Stderr, "gen error:", err)
+			}
+			continue
+		}
+
+		// cd
 		if strings.HasPrefix(line, "cd ") || line == "cd" {
 			target := strings.TrimSpace(strings.TrimPrefix(line, "cd"))
 			if target == "" {
@@ -77,14 +140,21 @@ func RunREPL(cfg *config.Config, uicfg ui.Config) {
 			continue
 		}
 
-		_ = runBashOnce(line)
+		// bash once + usage log
+		exitCode := runBashOnce(line)
+		if st.Usage != nil {
+			now := time.Now().Format(time.RFC3339)
+			cwd, _ := os.Getwd()
+			st.Usage.Append(usage.Record{Time: now, User: st.User, Type: "cmd", Cwd: cwd, Command: line})
+			_ = st.RAG.AddText("usage:"+now+":cmd", "[cmd] "+cwd+" $ "+line+" (exit="+strconv.Itoa(exitCode)+")", 8000)
+		}
 	}
 }
 
-func handleInternalCommand(cfg *config.Config, st *State, line string) bool {
+func handleInternalCommand(cfg *config.Config, st *State, uicfg ui.Config, line string) {
 	cmdline := strings.TrimSpace(strings.TrimPrefix(line, ":"))
 	if cmdline == "" {
-		return true
+		return
 	}
 	parts := strings.Fields(cmdline)
 	cmd := strings.ToLower(parts[0])
@@ -92,86 +162,251 @@ func handleInternalCommand(cfg *config.Config, st *State, line string) bool {
 
 	switch cmd {
 	case "help":
-		PrintHelp()
-		return true
-	case "bash":
-		fmt.Print("\n[Entering bash] (type 'exit' to return)\n")
-		if err := runInteractiveBash(); err != nil {
-			fmt.Fprintln(os.Stderr, "bash error:", err)
+		if len(args) > 0 {
+			PrintHelp(args[0])
+		} else {
+			PrintHelp("")
 		}
-		fmt.Print("\n[Back to KIKI]\n")
-		return true
+		return
+
+	case "llm":
+		// :llm show | :llm set <base_url> | :llm clear
+		if len(args) < 1 {
+			fmt.Println("usage: :llm show | :llm set <base_url> | :llm clear")
+			return
+		}
+		sub := strings.ToLower(strings.TrimSpace(args[0]))
+		switch sub {
+		case "show":
+			if strings.TrimSpace(cfg.BaseURL) == "" {
+				fmt.Printf("LLM_BASE_URL: (empty) -> using http://%s:%d\n", cfg.Host, cfg.Port)
+			} else {
+				fmt.Printf("LLM_BASE_URL: %s\n", cfg.BaseURL)
+			}
+			return
+		case "clear":
+			cfg.BaseURL = ""
+			fmt.Println("LLM_BASE_URL cleared (fallback to host:port)")
+			if uicfg.FixedHeader {
+				renderHeader(cfg, st, uicfg)
+			}
+			return
+		case "set":
+			if len(args) < 2 {
+				fmt.Println("usage: :llm set <base_url>")
+				return
+			}
+			url := strings.TrimSpace(args[1])
+			// allow: :llm set http://host:port  OR :llm set host:port
+			if url != "" && !strings.Contains(url, "://") {
+				url = "http://" + url
+			}
+			cfg.BaseURL = strings.TrimRight(url, "/")
+			fmt.Println("LLM_BASE_URL set:", cfg.BaseURL)
+			if uicfg.FixedHeader {
+				renderHeader(cfg, st, uicfg)
+			}
+			return
+		default:
+			// shorthand: :llm http://...
+			url := strings.TrimSpace(args[0])
+			if url != "" && (strings.Contains(url, "://") || strings.Contains(url, ":")) {
+				if !strings.Contains(url, "://") {
+					url = "http://" + url
+				}
+				cfg.BaseURL = strings.TrimRight(url, "/")
+				fmt.Println("LLM_BASE_URL set:", cfg.BaseURL)
+				if uicfg.FixedHeader {
+					renderHeader(cfg, st, uicfg)
+				}
+				return
+			}
+			fmt.Println("usage: :llm show | :llm set <base_url> | :llm clear")
+			return
+		}
+
+	case "gen":
+		// :gen <path> <prompt...>
+		if len(args) < 2 {
+			fmt.Println("usage: :gen <path> <prompt...>")
+			return
+		}
+		out := args[0]
+		p := strings.TrimSpace(strings.Join(args[1:], " "))
+		if err := Gen(cfg, st, out, p); err != nil {
+			fmt.Fprintln(os.Stderr, "gen error:", err)
+		}
+		if uicfg.FixedHeader {
+			renderHeader(cfg, st, uicfg)
+		}
+		return
+
+	case "pcp":
+		// :pcp show | :pcp host <host|local> | :pcp cpu | :pcp mem | :pcp load | :pcp raw <metric...>
+		if len(args) < 1 {
+			fmt.Println("usage: :pcp show | :pcp host <host|local> | :pcp cpu|mem|load | :pcp raw <metric...>")
+			return
+		}
+		sub := strings.ToLower(args[0])
+		switch sub {
+		case "show":
+			fmt.Println(st.PCP.Show())
+			return
+		case "host":
+			if len(args) < 2 {
+				fmt.Println("usage: :pcp host <host|local>")
+				return
+			}
+			st.PCP.SetHost(args[1])
+			fmt.Println("pcp host set:", st.PCP.HostLabel())
+			if uicfg.FixedHeader {
+				renderHeader(cfg, st, uicfg)
+			}
+			return
+		case "cpu":
+			out, err := st.PCP.CPUOnce()
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "pcp error:", err)
+				return
+			}
+			fmt.Println(out)
+			return
+		case "mem":
+			out, err := st.PCP.MemOnce()
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "pcp error:", err)
+				return
+			}
+			fmt.Println(out)
+			return
+		case "load":
+			out, err := st.PCP.LoadOnce()
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "pcp error:", err)
+				return
+			}
+			fmt.Println(out)
+			return
+		case "raw":
+			if len(args) < 2 {
+				fmt.Println("usage: :pcp raw <metric...>")
+				return
+			}
+			out, err := st.PCP.RawOnce(args[1:])
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "pcp error:", err)
+				return
+			}
+			fmt.Println(out)
+			return
+		default:
+			// shorthand: :pcp <host>
+			if len(args) == 1 {
+				st.PCP.SetHost(args[0])
+				fmt.Println("pcp host set:", st.PCP.HostLabel())
+				if uicfg.FixedHeader {
+					renderHeader(cfg, st, uicfg)
+				}
+				return
+			}
+			fmt.Println("usage: :pcp show | :pcp host <host|local> | :pcp cpu|mem|load | :pcp raw <metric...>")
+			return
+		}
+
+	case "bash":
+		fmt.Println("\n[Entering interactive bash] (type 'exit' to return)\n")
+		if err := runInteractiveBash(); err != nil {
+			fmt.Fprintln(os.Stderr, "pty bash error:", err)
+		}
+		fmt.Println("\n[Back to KIKI]\n")
+		if uicfg.FixedHeader {
+			renderHeader(cfg, st, uicfg)
+		}
+		return
+
 	case "profile":
 		if len(args) < 1 {
 			fmt.Println("usage: :profile fast|deep|none")
-			return true
+			return
 		}
 		st.Profile = args[0]
 		cfg.Profile = st.Profile
 		config.ApplyProfile(cfg)
-		return true
+		return
+
 	case "stream":
 		if len(args) < 1 {
 			fmt.Println("usage: :stream on|off")
-			return true
+			return
 		}
 		v := strings.ToLower(args[0])
 		st.Stream = (v == "on" || v == "1" || v == "true")
 		cfg.Stream = st.Stream
-		return true
-	case "timeout":
+		return
+
+	case "nofence":
 		if len(args) < 1 {
-			fmt.Printf("timeout: %ds\n", cfg.TimeoutSec)
-			fmt.Println("usage: :timeout <sec>")
-			return true
+			state := "off"
+			if st.NoFence {
+				state = "on"
+			}
+			fmt.Println("nofence:", state)
+			fmt.Println("usage: :nofence on|off")
+			return
 		}
-		n, err := strconv.Atoi(args[0])
-		if err != nil || n < 1 {
-			fmt.Println("invalid timeout:", args[0])
-			return true
-		}
-		cfg.TimeoutSec = n
-		fmt.Println("timeout set:", n, "sec")
-		return true
+		v := strings.ToLower(args[0])
+		on := (v == "on" || v == "1" || v == "true")
+		st.NoFence = on
+		cfg.NoFence = on
+		return
+
 	case "ui":
 		if len(args) < 2 {
-			fmt.Println("usage: :ui header on|off")
-			return true
+			fmt.Println("usage: :ui header on|off | :ui clear on|off")
+			return
 		}
 		sub := strings.ToLower(args[0])
 		val := strings.ToLower(args[1])
 		on := (val == "on" || val == "1" || val == "true")
-		if sub == "header" {
+		switch sub {
+		case "header":
+			uicfg.ShowHeader = on
 			st.UI.ShowHeader = on
-			return true
+		case "clear":
+			uicfg.ClearOnDraw = on
+			st.UI.ClearOnDraw = on
+		default:
+			fmt.Println("usage: :ui header on|off | :ui clear on|off")
 		}
-		fmt.Println("usage: :ui header on|off")
-		return true
+		return
+
 	case "ctx":
 		if len(args) < 1 {
 			fmt.Println("usage: :ctx set key=value | :ctx show | :ctx clear")
-			return true
+			return
 		}
 		sub := strings.ToLower(args[0])
 		switch sub {
 		case "set":
 			if len(args) < 2 {
 				fmt.Println("usage: :ctx set key=value")
-				return true
+				return
 			}
 			kv := strings.Join(args[1:], " ")
-			kvp := strings.SplitN(kv, "=", 2)
-			if len(kvp) != 2 {
+			parts2 := strings.SplitN(kv, "=", 2)
+			if len(parts2) != 2 {
 				fmt.Println("usage: :ctx set key=value")
-				return true
+				return
 			}
-			ctxSet(st, kvp[0], kvp[1])
-			fmt.Printf("ctx set: %s=%s\n", strings.TrimSpace(kvp[0]), strings.TrimSpace(kvp[1]))
-			return true
+			k := strings.TrimSpace(parts2[0])
+			v := strings.TrimSpace(parts2[1])
+			ctxSet(st, k, v)
+			fmt.Printf("ctx set: %s=%s\n", k, v)
+			return
 		case "show":
 			if len(st.Ctx) == 0 {
 				fmt.Println("(ctx empty)")
-				return true
+				return
 			}
 			keys := make([]string, 0, len(st.Ctx))
 			for k := range st.Ctx {
@@ -181,305 +416,131 @@ func handleInternalCommand(cfg *config.Config, st *State, line string) bool {
 			for _, k := range keys {
 				fmt.Printf("%s=%s\n", k, st.Ctx[k])
 			}
-			return true
+			return
 		case "clear":
 			ctxClear(st)
 			fmt.Println("ctx cleared")
-			return true
+			return
 		default:
 			fmt.Println("usage: :ctx set key=value | :ctx show | :ctx clear")
-			return true
+			return
 		}
+
 	case "ctx-size", "ctxsize":
 		if len(args) < 1 {
 			fmt.Printf("ctx-size: observed=%d target=%d\n", st.CtxSizeObserved, st.CtxSizeTarget)
 			fmt.Println("usage: :ctx-size <N>")
-			return true
+			return
 		}
 		n, err := strconv.Atoi(args[0])
 		if err != nil || n < 256 {
 			fmt.Println("invalid ctx-size:", args[0])
-			return true
+			return
 		}
 		st.CtxSizeTarget = n
 		cfg.CtxSizeTarget = n
 		fmt.Println("ctx-size target set:", n)
-		fmt.Println("note: restart llama.cpp server with --ctx-size", n)
-		return true
+		fmt.Println("note: actual ctx-size requires llama.cpp server restart with --ctx-size", n)
+		return
+
 	case "rag":
 		if len(args) < 1 {
-			en, docs := st.RAG.Stats()
-			fmt.Printf("rag: enabled=%v docs=%d\n", en, docs)
-			fmt.Println("usage: :rag on|off | :rag add <path> | :rag stats | :rag clear")
-			return true
+			fmt.Printf("rag: enabled=%v docs=%d\n", st.RAG.Enabled, len(st.RAG.Docs))
+			return
 		}
 		sub := strings.ToLower(args[0])
 		switch sub {
 		case "on":
-			st.RAG.Toggle(true)
-			cfg.RAGEnabled = true
+			st.RAG.Enabled = true
 			fmt.Println("rag enabled")
-			return true
 		case "off":
-			st.RAG.Toggle(false)
-			cfg.RAGEnabled = false
+			st.RAG.Enabled = false
 			fmt.Println("rag disabled")
-			return true
-		case "add":
-			if len(args) < 2 {
-				fmt.Println("usage: :rag add <path>")
-				return true
-			}
-			p := strings.Join(args[1:], " ")
-			d, err := st.RAG.AddFile(p, cfg.FileMaxBytes, cfg.FileMaxChars)
-			if err != nil {
-				fmt.Fprintln(os.Stderr, "rag add error:", err)
-				return true
-			}
-			fmt.Println("rag added:", d.Path)
-			return true
-		case "stats":
-			en, docs := st.RAG.Stats()
-			fmt.Printf("rag: enabled=%v docs=%d\n", en, docs)
-			return true
 		case "clear":
-			st.RAG.Clear()
+			st.RAG.Docs = nil
 			fmt.Println("rag cleared")
-			return true
+		case "stats":
+			fmt.Printf("rag docs=%d\n", len(st.RAG.Docs))
 		default:
-			fmt.Println("usage: :rag on|off | :rag add <path> | :rag stats | :rag clear")
-			return true
+			fmt.Println("usage: :rag on|off | :rag clear | :rag stats")
 		}
+		return
+
 	case "file":
 		if len(args) < 1 {
-			fmt.Println("usage: :file add|list|rm|clear ...")
-			return true
+			fmt.Println("usage: :file add /path | :file list | :file rm N | :file clear")
+			return
 		}
 		sub := strings.ToLower(args[0])
 		switch sub {
 		case "add":
 			if len(args) < 2 {
 				fmt.Println("usage: :file add /path")
-				return true
+				return
 			}
 			p := normalizePath(strings.Join(args[1:], " "))
 			if !fileExists(p) {
 				fmt.Println("file not found:", p)
-				return true
+				return
 			}
 			st.Files = append(st.Files, p)
 			fmt.Println("file added:", p)
-			// file->rag auto
-			if st.RAG != nil && st.RAG.Enabled {
-				_, _ = st.RAG.AddFile(p, cfg.FileMaxBytes, cfg.FileMaxChars)
-			}
-			return true
 		case "list":
 			if len(st.Files) == 0 {
 				fmt.Println("(no attached files)")
-				return true
+				return
 			}
 			for i, f := range st.Files {
 				fmt.Printf("%d) %s\n", i+1, f)
 			}
-			return true
 		case "rm":
 			if len(args) < 2 {
 				fmt.Println("usage: :file rm N")
-				return true
+				return
 			}
 			n, err := strconv.Atoi(args[1])
 			if err != nil || n < 1 || n > len(st.Files) {
 				fmt.Println("invalid index")
-				return true
+				return
 			}
 			idx := n - 1
 			removed := st.Files[idx]
 			st.Files = append(st.Files[:idx], st.Files[idx+1:]...)
 			fmt.Println("file removed:", removed)
-			return true
 		case "clear":
-			st.Files = []string{}
+			st.Files = nil
 			fmt.Println("files cleared")
-			return true
 		default:
-			fmt.Println("usage: :file add|list|rm|clear ...")
-			return true
+			fmt.Println("usage: :file add /path | :file list | :file rm N | :file clear")
 		}
+		return
+
 	case "history":
-		// :history show [N] | :history search <regex> [N] | :history path
-		if len(args) < 1 {
-			fmt.Println("usage: :history show [N] | :history search <regex> [N] | :history path")
-			return true
+		handleHistory(cfg, st, args)
+		return
+
+	case "usage":
+		if st.Usage == nil {
+			fmt.Println("usage: (not enabled)")
+			return
 		}
-		sub := strings.ToLower(args[0])
-		switch sub {
-		case "path":
-			fmt.Println(cfg.HistoryPath)
-			return true
-		case "show":
-			limit := 20
-			if len(args) >= 2 {
-				if n, err := strconv.Atoi(args[1]); err == nil && n > 0 {
-					limit = n
-				}
+		days := cfg.UsageLoadDays
+		if len(args) >= 1 {
+			if n, err := strconv.Atoi(args[0]); err == nil && n > 0 {
+				days = n
 			}
-			recs, err := history.ReadAll(cfg.HistoryPath)
-			if err != nil {
-				fmt.Fprintln(os.Stderr, "history read error:", err)
-				return true
-			}
-			if len(recs) == 0 {
-				fmt.Println("(history empty)")
-				return true
-			}
-			if limit > len(recs) {
-				limit = len(recs)
-			}
-			start := len(recs) - limit
-			for i := start; i < len(recs); i++ {
-				r := recs[i]
-				idx := i + 1
-				fmt.Printf("#%d %s | profile=%s | stream=%v | prompt=%s\n", idx, r.Time, r.Profile, r.Stream, truncateRunes(r.Prompt, 120))
-				if r.ResponsePrev != "" {
-					fmt.Printf("    ↳ %s\n", truncateRunes(r.ResponsePrev, 160))
-				}
-			}
-			return true
-		case "search":
-			if len(args) < 2 {
-				fmt.Println("usage: :history search <regex> [N]")
-				return true
-			}
-			pattern := args[1]
-			limit := 20
-			if len(args) >= 3 {
-				if n, err := strconv.Atoi(args[2]); err == nil && n > 0 {
-					limit = n
-				}
-			}
-			recs, err := history.ReadAll(cfg.HistoryPath)
-			if err != nil {
-				fmt.Fprintln(os.Stderr, "history read error:", err)
-				return true
-			}
-			re, err := regexp.Compile(pattern)
-			if err != nil {
-				fmt.Fprintln(os.Stderr, "invalid regex:", err)
-				return true
-			}
-			matches := 0
-			for i := len(recs) - 1; i >= 0; i-- {
-				r := recs[i]
-				if re.MatchString(r.Prompt) || re.MatchString(r.ResponsePrev) {
-					idx := i + 1
-					fmt.Printf("#%d %s | profile=%s | prompt=%s\n", idx, r.Time, r.Profile, truncateRunes(r.Prompt, 120))
-					if r.ResponsePrev != "" {
-						fmt.Printf("    ↳ %s\n", truncateRunes(r.ResponsePrev, 160))
-					}
-					matches++
-					if matches >= limit {
-						break
-					}
-				}
-			}
-			if matches == 0 {
-				fmt.Println("(no matches)")
-			}
-			return true
-		default:
-			fmt.Println("usage: :history show [N] | :history search <regex> [N] | :history path")
-			return true
 		}
+		recs, err := usage.LoadRecent(st.Usage.Path, days, cfg.UsageLoadMax)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "usage load error:", err)
+			return
+		}
+		fmt.Println(usage.Summary(recs))
+		return
+
 	case "exit", "quit":
-	case "history":
-		// :history show [N] | :history search <regex> [N] | :history path
-		if len(args) < 1 {
-			fmt.Println("usage: :history show [N] | :history search <regex> [N] | :history path")
-			return true
-		}
-		sub := strings.ToLower(args[0])
-		switch sub {
-		case "path":
-			fmt.Println(cfg.HistoryPath)
-			return true
-		case "show":
-			limit := 20
-			if len(args) >= 2 {
-				if n, err := strconv.Atoi(args[1]); err == nil && n > 0 {
-					limit = n
-				}
-			}
-			recs, err := history.ReadAll(cfg.HistoryPath)
-			if err != nil {
-				fmt.Fprintln(os.Stderr, "history read error:", err)
-				return true
-			}
-			if len(recs) == 0 {
-				fmt.Println("(history empty)")
-				return true
-			}
-			if limit > len(recs) {
-				limit = len(recs)
-			}
-			start := len(recs) - limit
-			for i := start; i < len(recs); i++ {
-				r := recs[i]
-				idx := i + 1
-				fmt.Printf("#%d %s | profile=%s | stream=%v | prompt=%s\n", idx, r.Time, r.Profile, r.Stream, truncateRunes(r.Prompt, 120))
-				if r.ResponsePrev != "" {
-					fmt.Printf("    ↳ %s\n", truncateRunes(r.ResponsePrev, 160))
-				}
-			}
-			return true
-		case "search":
-			if len(args) < 2 {
-				fmt.Println("usage: :history search <regex> [N]")
-				return true
-			}
-			pattern := args[1]
-			limit := 20
-			if len(args) >= 3 {
-				if n, err := strconv.Atoi(args[2]); err == nil && n > 0 {
-					limit = n
-				}
-			}
-			recs, err := history.ReadAll(cfg.HistoryPath)
-			if err != nil {
-				fmt.Fprintln(os.Stderr, "history read error:", err)
-				return true
-			}
-			re, err := regexp.Compile(pattern)
-			if err != nil {
-				fmt.Fprintln(os.Stderr, "invalid regex:", err)
-				return true
-			}
-			matches := 0
-			for i := len(recs) - 1; i >= 0; i-- {
-				r := recs[i]
-				if re.MatchString(r.Prompt) || re.MatchString(r.ResponsePrev) {
-					idx := i + 1
-					fmt.Printf("#%d %s | profile=%s | prompt=%s\n", idx, r.Time, r.Profile, truncateRunes(r.Prompt, 120))
-					if r.ResponsePrev != "" {
-						fmt.Printf("    ↳ %s\n", truncateRunes(r.ResponsePrev, 160))
-					}
-					matches++
-					if matches >= limit {
-						break
-					}
-				}
-			}
-			if matches == 0 {
-				fmt.Println("(no matches)")
-			}
-			return true
-		default:
-			fmt.Println("usage: :history show [N] | :history search <regex> [N] | :history path")
-			return true
-		}
 		ui.ResetScroll()
 		os.Exit(0)
 	}
 	fmt.Println("unknown command. try :help")
-	return true
 }
